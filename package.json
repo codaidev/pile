@@ -1,0 +1,81 @@
+{
+  "name": "pile",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pile：把散落在各个仓库和本地目录里的 Markdown 笔记聚到一个书架",
+  "author": "codaidev",
+  "license": "MIT",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "fetch-git": "node scripts/fetch-git.mjs",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "electron-builder",
+      "electron-winstaller"
+    ]
+  },
+  "build": {
+    "appId": "com.codaidev.pile",
+    "npmRebuild": false,
+    "productName": "Pile",
+    "copyright": "codaidev",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**/*",
+      "server/**/*",
+      "static/**/*",
+      "package.json",
+      "!**/*.map",
+      "!**/dev-data/**"
+    ],
+    "extraResources": [
+      {
+        "from": "git",
+        "to": "git",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "pile-${version}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Pile",
+      "installerLanguages": [
+        "zh_CN"
+      ],
+      "language": "2052",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "artifactName": "pile-${version}-setup.${ext}",
+      "include": "installer.nsh"
+    },
+    "afterPack": "build/afterPack.js"
+  }
+}

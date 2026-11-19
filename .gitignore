@@ -1,0 +1,20 @@
+# 依赖与产物
+node_modules/
+release/
+dist/
+*.log
+
+# 打包时才需要的 PortableGit（约 108 MB）：用 npm run fetch-git 下载
+git/
+
+# 运行期数据（开发调试用）
+dev-data/
+config.json
+*.tmp
+
+# 系统杂物
+Thumbs.db
+.DS_Store
+
+# fetch-git 的下载缓存
+.git-cache/
