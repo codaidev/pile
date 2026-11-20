@@ -18,7 +18,7 @@
     </div>
     <div class="shelf-actions">
       <button class="icon-btn" id="btn-theme-shelf" title="切换主题">◐</button>
-      <button class="icon-btn" id="btn-settings-shelf" title="连接仓库">⚙</button>
+      <button class="icon-btn" id="btn-settings-shelf" title="添加书">⚙</button>
     </div>
   </header>
 
@@ -26,7 +26,7 @@
 
   <p class="shelf-tip">
     书架上的书来自 <code>books.json</code>，一门课、一个专题就是一本。
-    点开一本书进入阅读，右上角「同步」把本地和仓库对齐。
+    点开一本书进入阅读。Pile 只读取，不会把任何内容写回仓库。
   </p>
 </section>
 
@@ -42,7 +42,7 @@
   </div>
   <div class="sync-zone">
     <span class="sync-status" id="sync-status">—</span>
-    <button class="btn-primary" id="btn-sync">同步</button>
+    <button class="btn-primary" id="btn-sync" title="从远端拉取最新内容（Pile 只拉取，不上传）">刷新</button>
   </div>
   <button class="icon-btn" id="btn-search" title="搜索 (/)">🔍</button>
   <button class="icon-btn" id="btn-theme" title="切换主题">◐</button>
@@ -56,7 +56,7 @@
     </div>
     <nav class="tree" id="tree"><div class="empty-hint">加载中…</div></nav>
     <div class="sidebar-foot">
-      <button class="link-btn" id="btn-settings">连接其他仓库</button>
+      <button class="link-btn" id="btn-settings">添加书</button>
     </div>
   </aside>
 
@@ -86,36 +86,51 @@
   </div>
 </div>
 
-<!-- 设置浮层 -->
+<!-- 添加书 / 设置浮层 -->
 <div class="overlay" id="setup-overlay" hidden>
   <div class="modal">
-    <h2>连接仓库</h2>
-    <label>仓库地址或本地路径
-      <input id="input-path" placeholder="https://github.com/you/notes.git 或 F:\notes">
+    <h2>添加一本书</h2>
+    <label>GitHub 仓库地址
+      <input id="input-path" placeholder="https://github.com/you/notes.git">
     </label>
-    <label>克隆到（只在填地址时用，留空放到 ~/notes/仓库名）
-      <input id="input-dest" placeholder="留空即可">
+    <label>或者：本地目录（只读，不联网、不改动）
+      <input id="input-local" placeholder="F:\notes\my-notes">
     </label>
     <label>GitHub Token（私有仓库必需，留空则沿用已保存的）
       <input id="input-token" type="password" placeholder="github_pat_…">
     </label>
-    <p class="hint">Token 用 Windows DPAPI 加密后存在本机 config.json，只有本机这个账户能解开；
-      建议新建一个只对该仓库有 contents 读写权限的细粒度 PAT。</p>
+    <p class="hint">Pile 只读不写：仓库会被克隆到自己的目录，之后只做拉取更新，
+      不会提交、不会推送。Token 用 Windows DPAPI 加密存在本机 config.json；
+      建议新建只勾 <b>Contents: Read-only</b> 的细粒度 PAT。</p>
     <div class="modal-actions">
       <button class="link-btn" id="btn-cancel-setup">取消</button>
-      <button class="btn-primary" id="btn-do-setup">连接</button>
+      <button class="btn-primary" id="btn-do-setup">添加</button>
     </div>
     <div class="modal-msg" id="setup-msg"></div>
   </div>
 </div>
 
-<!-- 同步报告 -->
+<!-- 更新报告 -->
 <div class="overlay" id="report-overlay" hidden>
   <div class="modal">
-    <h2 id="report-title">同步结果</h2>
+    <h2 id="report-title">更新结果</h2>
     <div id="report-body"></div>
     <div class="modal-actions">
       <button class="btn-primary" id="btn-close-report">知道了</button>
+    </div>
+  </div>
+</div>
+
+<!-- 本地有改动：让用户选「放弃这次更新」还是「丢弃本地改动」 -->
+<div class="overlay" id="discard-overlay" hidden>
+  <div class="modal">
+    <h2>本地有改动</h2>
+    <p class="muted" id="discard-desc">这个仓库的本地副本被你改过了，Pile 不会替你提交，也不会替你丢弃。</p>
+    <div id="discard-list"></div>
+    <p class="hint">选择「丢弃改动并更新」时，被丢弃的改动会先备份成 patch，放在数据目录的 trash 里。</p>
+    <div class="modal-actions">
+      <button class="link-btn" id="btn-discard-cancel">取消更新</button>
+      <button class="btn-danger" id="btn-discard-confirm">丢弃改动并更新</button>
     </div>
   </div>
 </div>

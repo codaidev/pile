@@ -95,22 +95,45 @@ function countMd(root, cap = 999) {
   return n;
 }
 
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+const expandPath = (p) => path.resolve(String(p || '').replace(/^~/, process.env.USERPROFILE || ''));
+
+/** Pile 自己管理的仓库目录：<数据目录>\repos\<书 id> */
+function reposDir() { return path.join(dataDir, 'repos'); }
+function trashDir() { return path.join(dataDir, 'trash'); }
+
+function bookKind(b, base) {
+  if (!b.repo && !b.remote) return 'local';        // 只有 local：纯静态只读
+  const inside = base && (base === reposDir() || base.startsWith(reposDir() + path.sep));
+  return inside ? 'git-managed' : 'git-external';
+}
+
 function decorateBook(b, idx = 0) {
-  const repo = b.repo ? path.resolve(String(b.repo).replace(/^~/, process.env.USERPROFILE || '')) : '';
   const dir = String(b.dir || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-  const root = repo && dir ? path.join(repo, ...dir.split('/').filter(Boolean)) : repo;
-  const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
-  const ready = !!repo && isDir(path.join(repo, '.git')) && isDir(root);
-  const id = String(b.id || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  const id = String(b.id || '').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '');
+  const bookId = id || `book-${idx}`;
+
+  // 书的根目录来源：repo（显式路径）> remote（克隆到管理目录）> local（本地目录）
+  let base = '';
+  if (b.repo) base = expandPath(b.repo);
+  else if (b.remote) base = path.join(reposDir(), bookId);
+  else if (b.local) base = expandPath(b.local);
+
+  const kind = bookKind(b, base);
+  const root = base ? (dir ? path.join(base, ...dir.split('/').filter(Boolean)) : base) : '';
+  const ready = !!base && isDir(root) && (kind === 'local' ? true : isDir(path.join(base, '.git')));
   const title = b.title || (root ? path.basename(root) : '') || '未命名';
+
   return {
-    id: id || `book-${idx}`,
+    id: bookId,
     title,
     subtitle: b.subtitle || '',
     cover: b.cover || '#4c6ef5',
-    repo,
+    kind,                       // git-managed | git-external | local
+    repo: base,                 // 实际读文件的目录（git 书是仓库根）
     dir,
     remote: b.remote || '',
+    local: b.local ? expandPath(b.local) : '',
     ready,
     count: ready ? countMd(root) : 0,
   };
@@ -120,8 +143,12 @@ function loadBooks() {
   const raw = (readJson(booksPath(), { books: [] }).books) || [];
   let list = Array.isArray(raw) ? raw : [];
   if (!list.length) {
-    const repo = loadConfig().repo || '';
-    if (repo) list = [{ id: 'notes', title: path.basename(repo), repo, subtitle: '整仓即为一本' }];
+    const cfg = loadConfig();
+    if (cfg.repo) {
+      list = [{ id: 'notes', title: path.basename(cfg.repo), repo: cfg.repo, subtitle: '整仓即为一本' }];
+    } else if (cfg.remote) {
+      list = [{ id: 'notes', title: cfg.remote.replace(/\/+$/, '').split('/').pop().replace(/\.git$/, ''), remote: cfg.remote }];
+    }
   }
   const books = [];
   const seen = new Set();
@@ -132,6 +159,19 @@ function loadBooks() {
     books.push(bk);
   });
   return books;
+}
+
+/** 往 books.json 里新增/覆盖一书（书架上只展示；增删仍以文件为准） */
+function upsertBook(entry) {
+  const doc = readJson(booksPath(), { books: [] });
+  const list = Array.isArray(doc.books) ? doc.books : [];
+  const id = String(entry.id || '').trim();
+  if (!id) return null;
+  const i = list.findIndex((b) => String(b.id) === id);
+  if (i >= 0) list[i] = Object.assign({}, list[i], entry);
+  else list.push(entry);
+  writeJson(booksPath(), { books: list });
+  return decorateBook(list.find((b) => String(b.id) === id));
 }
 
 function findBook(bookId = '') {
@@ -152,6 +192,7 @@ module.exports = {
   setDataDir, getDataDir, setCrypto, hasCrypto,
   loadConfig, saveConfig,
   setToken, getToken, hasToken,
-  countMd, decorateBook, loadBooks, findBook, bookRootOf,
+  countMd, decorateBook, loadBooks, upsertBook, findBook, bookRootOf,
+  reposDir, trashDir, isDir, expandPath,
   configPath, booksPath,
 };

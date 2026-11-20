@@ -17,40 +17,89 @@ const isDev = !app.isPackaged;
 
 app.setName(APP_NAME);
 
-// 用户数据：%APPDATA%\Pile（开发时可用 PILE_DATA / NOTES_READER_DATA 指到别处）
+// 数据目录（便携版：所有数据都在程序目录的 data 下）
+//   1. PILE_DATA / NOTES_READER_DATA 环境变量优先（调试、多实例）
+//   2. 打包后：<exe 所在目录>\data          ← 整个文件夹拷走就是搬家
+//   3. 开发（未打包）：%APPDATA%\Pile      ← 不往源码目录里写东西
 function resolveDataDir() {
   const override = process.env.PILE_DATA || process.env.NOTES_READER_DATA;
   if (override) return path.resolve(override);
+  if (app.isPackaged) return path.join(path.dirname(process.execPath), 'data');
   return path.join(app.getPath('appData'), APP_NAME);
 }
 
 const DATA_DIR = resolveDataDir();
+ensureDataWritable();
 migrateLegacyDataDir();
 
 // Chromium 自己的缓存（Cache/GPUCache/Local Storage）放到子目录，不要和笔记数据混在一起
 app.setPath('userData', path.join(DATA_DIR, 'chromium'));
 
-// 旧版本叫「笔记阅读器」：把它的数据搬到 Pile 下，用户不用重新连一次仓库
-function migrateLegacyDataDir() {
-  const legacy = path.join(app.getPath('appData'), '笔记阅读器');
-  if (path.resolve(legacy) === path.resolve(DATA_DIR)) return;
+/**
+ * 便携化的第一步：确认数据目录真的能写。
+ * 写不进去（Program Files、只读 U 盘、被安全软件锁住）就直接说清楚并退出，
+ * 否则会出现「界面能用但什么都不保存」这种最难查的状态。
+ *
+ * 注意：showErrorBox 不会自动换行，宽度按最长的一行撑开，所以这里自己按字符数折行，
+ * 路径太长就中间省略，保证中文提示不会被裁掉。
+ */
+function ensureDataWritable() {
+  const probe = path.join(DATA_DIR, '.write-probe');
   try {
-    if (!fs.existsSync(legacy)) return;
-    if (fs.existsSync(path.join(DATA_DIR, 'books.json'))) return; // 已有 Pile 数据，不覆盖
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    for (const f of ['books.json', 'config.json', 'window-state.json']) {
-      const src = path.join(legacy, f);
-      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(DATA_DIR, f));
-    }
-    const logsSrc = path.join(legacy, 'logs');
-    const logsDst = path.join(DATA_DIR, 'logs');
-    if (fs.existsSync(logsSrc)) {
-      fs.mkdirSync(logsDst, { recursive: true });
-      for (const f of fs.readdirSync(logsSrc)) {
-        try { fs.copyFileSync(path.join(logsSrc, f), path.join(logsDst, f)); } catch { /* ignore */ }
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
+  } catch (e) {
+    const shortPath = DATA_DIR.length > 48
+      ? DATA_DIR.slice(0, 22) + '…' + DATA_DIR.slice(-22)
+      : DATA_DIR;
+    const lines = [
+      'Pile 无法写入数据目录',
+      '',
+      '这个文件夹不能保存书架和配置。',
+      `目录：${shortPath}`,
+      `原因：${(e && (e.code || e.message)) || '未知'}`,
+      '',
+      '请把整个 Pile 文件夹放到可写的位置',
+      '（例如 D:\\Pile 或 U 盘），不要放在',
+      'C:\\Program Files 这类目录里再启动。',
+    ];
+    const msg = lines.join('\n');
+    try { dialog.showErrorBox('Pile', msg); } catch { /* 没有 GUI 时忽略 */ }
+    app.exit(1);
+  }
+}
+
+/**
+ * 把老版本的数据搬进当前数据目录，用户不用重新连一次仓库。
+ * 来源：%APPDATA%\笔记阅读器（Electron 早期版）、%APPDATA%\Pile（安装版）。
+ * 只在当前目录还没有 books.json 时搬，绝不覆盖已有数据。
+ */
+function migrateLegacyDataDir() {
+  if (fs.existsSync(path.join(DATA_DIR, 'books.json'))) return;
+  const sources = [
+    path.join(app.getPath('appData'), '笔记阅读器'),
+    path.join(app.getPath('appData'), APP_NAME),
+  ].filter((p) => path.resolve(p) !== path.resolve(DATA_DIR) && fs.existsSync(p));
+  for (const legacy of sources) {
+    try {
+      if (!fs.existsSync(path.join(legacy, 'books.json'))) continue;
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      for (const f of ['books.json', 'config.json', 'window-state.json']) {
+        const src = path.join(legacy, f);
+        if (fs.existsSync(src)) fs.copyFileSync(src, path.join(DATA_DIR, f));
       }
-    }
-  } catch { /* 迁移失败不影响启动 */ }
+      const logsSrc = path.join(legacy, 'logs');
+      const logsDst = path.join(DATA_DIR, 'logs');
+      if (fs.existsSync(logsSrc)) {
+        fs.mkdirSync(logsDst, { recursive: true });
+        for (const f of fs.readdirSync(logsSrc)) {
+          try { fs.copyFileSync(path.join(logsSrc, f), path.join(logsDst, f)); } catch { /* ignore */ }
+        }
+      }
+      return; // 搬完一个来源就停
+    } catch { /* 迁移失败不影响启动 */ }
+  }
 }
 
 const STATIC_DIR = path.join(__dirname, '..', 'static');
@@ -68,6 +117,9 @@ function log(...args) {
 }
 function ensureDirs() {
   fs.mkdirSync(path.join(DATA_DIR, 'logs'), { recursive: true });
+  // Pile 只管自己克隆出来的仓库；trash 存「丢弃本地改动」前备份的 patch
+  fs.mkdirSync(path.join(DATA_DIR, 'repos'), { recursive: true });
+  fs.mkdirSync(path.join(DATA_DIR, 'trash'), { recursive: true });
 }
 process.on('uncaughtException', (e) => log('uncaughtException:', (e && e.stack) || String(e)));
 process.on('unhandledRejection', (e) => log('unhandledRejection:', (e && e.stack) || String(e)));

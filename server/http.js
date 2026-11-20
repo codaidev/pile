@@ -77,7 +77,7 @@ function readBody(req, limit = 1024 * 1024) {
 }
 
 function createServer({ staticDir }) {
-  let syncing = false;
+  let refreshing = false;
 
   async function serveStatic(res, urlPath) {
     const rel = urlPath.replace(/^\/+/, '') || 'index.html';
@@ -96,28 +96,42 @@ function createServer({ staticDir }) {
     const bid = qs.get('book') || '';
 
     if (u.pathname === '/api/ping') {
-      return send(res, 200, { ok: true, app: 'pile', version: 2 });
+      return send(res, 200, { ok: true, app: 'pile', version: 3, readonly: true });
     }
 
     if (u.pathname === '/api/library') {
-      return send(res, 200, {
-        ok: true,
-        books: store.loadBooks().map((b) => ({
-          id: b.id, title: b.title, subtitle: b.subtitle, cover: b.cover,
-          remote: b.remote, ready: b.ready, count: b.count,
-        })),
-      });
+      const books = store.loadBooks().map((b) => ({
+        id: b.id, title: b.title, subtitle: b.subtitle, cover: b.cover,
+        kind: b.kind, ready: b.ready, count: b.count,
+      }));
+      return send(res, 200, { ok: true, books, readonly: true });
     }
 
     if (u.pathname === '/api/state') {
       const b = store.findBook(bid);
-      const p = b ? b.repo : store.loadConfig().repo || '';
-      if (!p) return send(res, 200, { ok: false, configured: false });
-      const st = await git.repoState(p);
-      st.configured = true;
-      st.has_token = store.hasToken();
-      st.book = b ? { id: b.id, title: b.title } : null;
-      return send(res, 200, st);
+      if (!b) return send(res, 200, { ok: false, configured: false, error: '没有配置任何书' });
+      const common = {
+        configured: true,
+        has_token: store.hasToken(),
+        kind: b.kind,
+        book: { id: b.id, title: b.title },
+        last_sync: store.loadConfig().last_sync || 0,
+      };
+      if (!b.ready) {
+        return send(res, 200, Object.assign({}, common, {
+          ok: false,
+          path: b.repo || '',
+          error: b.kind === 'local' ? '目录不存在' : '仓库还没克隆到本地',
+        }));
+      }
+      if (b.kind === 'local') {
+        return send(res, 200, Object.assign({}, common, {
+          ok: true, path: b.repo, branch: '', remote: '', push_disabled: true,
+          ahead: 0, behind: 0, dirty: [], dirty_count: 0, head: '',
+        }));
+      }
+      const st = await git.repoState(b.repo, { fetch: false });
+      return send(res, 200, Object.assign({}, common, st));
     }
 
     if (u.pathname === '/api/tree') {
@@ -156,39 +170,40 @@ function createServer({ staticDir }) {
   async function handlePost(req, res, u, qs) {
     const body = await readBody(req);
 
-    if (u.pathname === '/api/setup') {
-      const p = String(body.path || '').trim();
-      let isDir = false;
-      try { isDir = fs.statSync(p).isDirectory(); } catch { isDir = false; }
-      if (!isDir) return send(res, 400, { ok: false, error: '目录不存在' });
-      const cfg = store.loadConfig();
-      cfg.repo = path.resolve(p);
-      store.saveConfig(cfg);
-      if (body.token) store.setToken(body.token);
-      return send(res, 200, await git.repoState(cfg.repo));
+    // 只读模型：这里没有任何「写回远端」的入口。
+    if (u.pathname === '/api/add-local') {
+      const p = String(body.path || '').trim().replace(/^["']|["']$/g, '');
+      if (!p) return send(res, 400, { ok: false, error: '需要目录路径' });
+      const abs = store.expandPath(p);
+      if (!store.isDir(abs)) return send(res, 400, { ok: false, error: '目录不存在' });
+      const raw = abs.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+      const base = raw.split('/').pop();
+      const id = base.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '') || 'local';
+      const book = store.upsertBook({
+        id, title: String(body.title || '').trim() || base, subtitle: '本地目录', local: abs,
+      });
+      return send(res, 200, { ok: true, book, kind: 'local' });
     }
 
     if (u.pathname === '/api/clone') {
       const url = String(body.url || '').trim();
-      let dest = String(body.dest || '').trim();
       const token = String(body.token || '').trim();
       if (!url) return send(res, 400, { ok: false, error: '需要仓库地址' });
-      if (!dest) {
-        const name = url.replace(/\/+$/, '').split('/').pop().replace(/\.git$/, '') || 'notes';
-        dest = path.join(process.env.USERPROFILE || require('os').homedir(), 'notes', name);
-      }
+      const name = url.replace(/\/+$/, '').split('/').pop().replace(/\.git$/, '') || 'notes';
+      const id = name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '') || 'notes';
+      const dest = path.join(store.reposDir(), id);
       if (token) store.setToken(token);
-      let res2;
-      if (fs.existsSync(path.join(dest, '.git'))) {
-        res2 = { ok: true, path: dest };
+      let r = { ok: true, path: dest };
+      if (!fs.existsSync(path.join(dest, '.git'))) {
+        r = await git.cloneRepo(url, dest, token || store.getToken());
       } else {
-        res2 = await git.cloneRepo(url, dest, token || store.getToken());
+        await git.ensureNoPush(dest);
       }
-      if (!res2.ok) return send(res, 200, res2);
-      const cfg = store.loadConfig();
-      cfg.repo = path.resolve(dest);
-      store.saveConfig(cfg);
-      return send(res, 200, await git.repoState(cfg.repo));
+      if (!r.ok) return send(res, 200, r);
+      const book = store.upsertBook({
+        id, title: String(body.title || '').trim() || name, subtitle: '', remote: url,
+      });
+      return send(res, 200, { ok: true, book, kind: 'git-managed' });
     }
 
     if (u.pathname === '/api/token') {
@@ -196,17 +211,28 @@ function createServer({ staticDir }) {
       return send(res, 200, { ok: true, has_token: store.hasToken() });
     }
 
-    if (u.pathname === '/api/sync') {
+    // 单向更新：pull-only。push 在这个进程里根本不存在。
+    if (u.pathname === '/api/refresh') {
       const bid = qs.get('book') || String(body.book || '');
       const b = store.findBook(bid);
-      const p = b ? b.repo : store.loadConfig().repo || '';
-      if (!p) return send(res, 400, { ok: false, error: '未配置仓库' });
-      if (syncing) return send(res, 429, { ok: false, error: '已有同步在进行' });
-      syncing = true;
+      if (!b) return send(res, 400, { ok: false, error: '没有这本书' });
+      if (!b.ready) return send(res, 400, { ok: false, error: '这本书还没准备好' });
+      if (b.kind === 'local') {
+        return send(res, 200, { ok: false, code: 'local', error: '本地目录书不需要更新，它就在你这台机器上' });
+      }
+      if (b.kind === 'git-external') {
+        return send(res, 200, {
+          ok: false, code: 'external',
+          error: '这是你自己的仓库目录，Pile 不会碰它；要自动更新请让 Pile 克隆一份',
+        });
+      }
+      if (refreshing) return send(res, 429, { ok: false, error: '已有更新在进行' });
+      refreshing = true;
       try {
-        return send(res, 200, await git.syncRepo(p));
+        const rep = await git.pullRepo(b.repo, { discard: !!body.discard, bookId: b.id });
+        return send(res, rep.code === 'dirty' ? 409 : 200, rep);
       } finally {
-        syncing = false;
+        refreshing = false;
       }
     }
 

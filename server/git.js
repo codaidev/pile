@@ -1,12 +1,20 @@
 'use strict';
 /**
- * git 层：调用 bundled PortableGit。
- * 与 Python 版行为完全一致：提交 → fetch → rebase/ff-only → push，冲突即 abort，绝不 force。
+ * git 层：只读模型。
+ *
+ * Pile 对仓库只做三件事：克隆、拉取并快进、报告状态。
+ * 它不提交、不推送、不改写历史 —— 代码里没有任何 add/commit/push 调用。
+ *
+ * 结构性保证：克隆完成后把 remote.origin.pushurl 指向一个无效地址，
+ * 即使有人拿到这个仓库手动 push 也会失败；每次拉取前再复核一次，
+ * 防止有谁手动改回去。
  */
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const store = require('./store');
+
+const NO_PUSH_URL = 'https://push.disabled/pile';
 
 let gitBinOverride = '';
 
@@ -44,31 +52,12 @@ function authArgs(token) {
   return ['-c', `http.https://github.com/.extraheader=Authorization: Basic ${basic}`];
 }
 
-// 提交 / 变基 / 合并需要身份信息；用户机器上常常没配全局 user.name、user.email，
-// 缺失时 rebase 会报 "Committer identity unknown"，以前被误判成冲突。
-const IDENTITY_ARGS = ['-c', 'user.name=Pile', '-c', 'user.email=pile@localhost'];
-const MUTATING = new Set(['commit', 'rebase', 'merge', 'cherry-pick', 'revert', 'am', 'stash', 'tag']);
-
-/**
- * 找出真正的子命令（跳过 -c key=value 这类选项）
- */
-function subcommand(args) {
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '-c') { i++; continue; }
-    if (a.startsWith('-')) continue;
-    return a;
-  }
-  return '';
-}
-
 /**
  * @returns {Promise<{code:number, out:string, err:string}>}
  */
-function runGit(args, cwd, { token = '', timeout = 180000 } = {}) {
+function runGit(args, cwd, { token = '', timeout = 120000 } = {}) {
   const git = findGit();
-  const idArgs = MUTATING.has(subcommand(args)) ? IDENTITY_ARGS : [];
-  const argv = [...baseArgs(), ...authArgs(token), ...idArgs, ...args];
+  const argv = [...baseArgs(), ...authArgs(token), ...args];
   const env = {
     ...process.env,
     GIT_TERMINAL_PROMPT: '0',
@@ -114,7 +103,21 @@ async function countAheadBehind(dir, branch) {
   return { ahead: 0, behind: 0 };
 }
 
-async function repoState(repoPath) {
+/**
+ * 让这个仓库推不出去：pushurl 指向一个必然连接失败、且不是 GitHub 的地址。
+ * 只改本地配置，不动远端、不动工作区。
+ */
+async function ensureNoPush(repoPath) {
+  const cur = await runGit(['remote', 'get-url', '--push', 'origin'], repoPath);
+  if (cur.code === 0 && cur.out.trim() === NO_PUSH_URL) return { ok: true, changed: false };
+  const set = await runGit(['config', 'remote.origin.pushurl', NO_PUSH_URL], repoPath);
+  return { ok: set.code === 0, changed: true, error: set.err };
+}
+
+/**
+ * 只读状态：默认不联网（fetch=false），打开书时不会因为网络卡住界面。
+ */
+async function repoState(repoPath, { fetch: doFetch = false, token = store.getToken() } = {}) {
   if (!repoPath || !fs.existsSync(path.join(repoPath, '.git'))) {
     return { ok: false, error: '该目录不是 git 仓库' };
   }
@@ -123,23 +126,23 @@ async function repoState(repoPath) {
   if (remoteRes.code !== 0) {
     return { ok: false, error: '仓库没有配置 origin 远端' };
   }
-  const remote = remoteRes.out;
-
-  await runGit(['fetch', '--quiet', 'origin'], repoPath, { token: store.getToken(), timeout: 90000 });
+  if (doFetch) {
+    await runGit(['fetch', '--quiet', 'origin'], repoPath, { token, timeout: 90000 });
+  }
   const { ahead, behind } = await countAheadBehind(repoPath, branch);
-
+  const pushUrl = await runGit(['remote', 'get-url', '--push', 'origin'], repoPath);
   const statusRes = await runGit(['status', '--porcelain'], repoPath);
   const dirty = statusRes.code === 0
     ? statusRes.out.split(/\r?\n/).filter((l) => l.trim()).map((l) => l.slice(3))
     : [];
-
   const logRes = await runGit(['log', '-1', '--format=%h %s', 'HEAD'], repoPath);
 
   return {
     ok: true,
     path: repoPath,
     branch,
-    remote,
+    remote: remoteRes.out,
+    push_disabled: pushUrl.code === 0 && pushUrl.out.trim() === NO_PUSH_URL,
     ahead,
     behind,
     dirty,
@@ -150,22 +153,48 @@ async function repoState(repoPath) {
   };
 }
 
+/**
+ * 克隆到 Pile 自己的目录，克隆完立刻堵死 push。
+ */
 async function cloneRepo(url, dest, token) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const r = await runGit(['clone', '--progress', url, dest], path.dirname(dest), { token, timeout: 600000 });
   if (r.code !== 0) return { ok: false, error: r.err || r.out || '克隆失败' };
+  await ensureNoPush(dest);
   return { ok: true, path: dest };
 }
 
 function stamp() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-async function syncRepo(repoPath) {
+/** 丢弃本地改动之前，先把已跟踪文件的改动存成 patch，人工还能找回来。 */
+async function savePatch(repoPath, bookId) {
+  const diff = await runGit(['diff', 'HEAD'], repoPath);
+  if (diff.code !== 0 || !diff.out.trim()) return '';
+  try {
+    const dir = path.join(store.getDataDir(), 'trash');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${bookId}-${stamp()}.patch`);
+    fs.writeFileSync(file, diff.out, 'utf8');
+    return file;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 单向更新：fetch → 快进到远端。绝不提交、绝不推送。
+ *
+ * - 本地干净：直接快进。
+ * - 本地有改动：默认拒绝（code='dirty'），把文件列表交给前端去问用户。
+ * - discard=true：先把改动存成 patch，再 reset --hard 对齐远端。
+ */
+async function pullRepo(repoPath, { discard = false, bookId = '' } = {}) {
   const token = store.getToken();
-  const report = { steps: [], ok: false, conflicts: [], pushed: 0, pulled: 0 };
+  const report = { ok: false, steps: [], pulled: 0, discarded: [], trash: '' };
   const step = (name, ok, detail = '') => {
     report.steps.push({ name, ok, detail });
     return ok;
@@ -178,19 +207,23 @@ async function syncRepo(repoPath) {
   }
   const branch = branchRes.out.trim();
 
-  // 1. 本地改动先提交，保证任何情况下不丢
+  // 0. 复核 push 通道确实被堵死（本地配置，不联网）
+  const guard = await ensureNoPush(repoPath);
+  step('确认不可推送', guard.ok, guard.ok ? 'push 通道已禁用' : (guard.error || '无法写入 pushurl'));
+
+  // 1. 本地改动检查
   const st = await runGit(['status', '--porcelain'], repoPath);
-  if (st.out.trim()) {
-    await runGit(['add', '-A'], repoPath);
-    const msg = `notes: auto commit ${stamp()}`;
-    const c = await runGit(
-      ['-c', 'user.name=Pile', '-c', 'user.email=pile@localhost', 'commit', '-m', msg],
-      repoPath
-    );
-    step('提交本地改动', c.code === 0, `${st.out.split(/\r?\n/).filter((x) => x.trim()).length} 个文件`);
-  } else {
-    step('提交本地改动', true, '没有改动');
+  const dirty = st.code === 0
+    ? st.out.split(/\r?\n/).filter((l) => l.trim()).map((l) => l.slice(3))
+    : [];
+  if (dirty.length && !discard) {
+    step('检查本地改动', false, `${dirty.length} 个文件有改动`);
+    report.code = 'dirty';
+    report.dirty = dirty;
+    report.error = '本地有改动，Pile 不会替你提交或丢弃';
+    return report;
   }
+  step('检查本地改动', true, dirty.length ? `${dirty.length} 个文件（将丢弃）` : '工作区干净');
 
   // 2. 拉取
   const fetchRes = await runGit(['fetch', 'origin'], repoPath, { token, timeout: 180000 });
@@ -199,52 +232,34 @@ async function syncRepo(repoPath) {
     return report;
   }
 
-  const { ahead, behind } = await countAheadBehind(repoPath, branch);
-  report.ahead = ahead;
+  const { behind } = await countAheadBehind(repoPath, branch);
   report.behind = behind;
 
-  // 3. 合并远端
-  if (behind) {
-    if (ahead) {
-      const rb = await runGit(['rebase', `origin/${branch}`], repoPath, { timeout: 180000 });
-      if (rb.code !== 0) {
-        const cf = await runGit(['diff', '--name-only', '--diff-filter=U'], repoPath);
-        const conflicts = cf.out.split(/\r?\n/).filter((x) => x.trim());
-        await runGit(['rebase', '--abort'], repoPath);
-        if (conflicts.length) {
-          step('变基到远端', false, '存在冲突，已回滚到同步前状态');
-          report.conflicts = conflicts;
-          report.error = '存在冲突，需要手工解决';
-        } else {
-          step('变基到远端', false, (rb.err || 'rebase 失败').slice(0, 400));
-          report.error = (rb.err || 'rebase 失败').slice(0, 400);
-        }
-        return report;
-      }
-      step('变基到远端', true, `${behind} 个提交`);
-      report.pulled = behind;
-    } else {
-      const mg = await runGit(['merge', '--ff-only', `origin/${branch}`], repoPath);
-      step('快进到远端', mg.code === 0, `${behind} 个提交`);
-      report.pulled = mg.code === 0 ? behind : 0;
+  // 3. 丢弃本地改动（用户已确认）
+  if (dirty.length && discard) {
+    report.trash = await savePatch(repoPath, bookId || path.basename(repoPath));
+    const r = await runGit(['reset', '--hard', `origin/${branch}`], repoPath);
+    step('丢弃本地改动', r.code === 0, report.trash ? `改动已备份到 ${report.trash}` : '未备份');
+    report.discarded = dirty;
+    if (r.code !== 0) {
+      report.error = r.err || 'reset 失败';
+      return report;
     }
+    report.pulled = behind;
+  } else if (behind) {
+    // 4. 快进
+    const mg = await runGit(['merge', '--ff-only', `origin/${branch}`], repoPath);
+    if (!step('快进到远端', mg.code === 0, mg.code ? (mg.err || '').slice(0, 300) : `${behind} 个提交`)) {
+      report.error = (mg.err || '快进失败').slice(0, 300);
+      return report;
+    }
+    report.pulled = behind;
   } else {
     step('快进到远端', true, '远端没有新提交');
   }
 
-  // 4. 推送
-  const cnt = await runGit(['rev-list', '--count', `origin/${branch}..HEAD`], repoPath);
-  const toPush = cnt.code === 0 ? parseInt(cnt.out.trim() || '0', 10) || 0 : 0;
-  if (toPush) {
-    const ps = await runGit(['push', 'origin', `HEAD:${branch}`], repoPath, { token, timeout: 180000 });
-    if (!step('推送到远端', ps.code === 0, ps.code ? ps.err : `${toPush} 个提交`)) {
-      report.error = ps.err || 'push 失败';
-      return report;
-    }
-    report.pushed = toPush;
-  } else {
-    step('推送到远端', true, '没有新提交');
-  }
+  const headRes = await runGit(['log', '-1', '--format=%h %s', 'HEAD'], repoPath);
+  report.head = headRes.code === 0 ? headRes.out : '';
 
   const cfg = store.loadConfig();
   cfg.last_sync = Math.floor(Date.now() / 1000);
@@ -253,4 +268,6 @@ async function syncRepo(repoPath) {
   return report;
 }
 
-module.exports = { setGitBin, findGit, runGit, repoState, cloneRepo, syncRepo };
+module.exports = {
+  setGitBin, findGit, runGit, repoState, cloneRepo, pullRepo, ensureNoPush, NO_PUSH_URL,
+};

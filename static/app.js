@@ -1,6 +1,7 @@
 /* Pile · 前端逻辑（只读）
    视图：书架（/）→ 阅读（/read/<book>/<path>）
-   书架数据来自 books.json，由 /api/library 提供；阅读只读，同步靠 git。 */
+   书架数据来自 books.json，由 /api/library 提供。
+   Pile 只会从远端「拉取」：没有提交、没有推送，界面里也不存在上传入口。 */
 
 const $ = (sel) => document.querySelector(sel);
 const el = {
@@ -12,6 +13,7 @@ const el = {
   searchOverlay: $('#search-overlay'), searchInput: $('#search-input'),
   searchResults: $('#search-results'), searchMeta: $('#search-meta'),
   setupOverlay: $('#setup-overlay'), reportOverlay: $('#report-overlay'),
+  discardOverlay: $('#discard-overlay'), discardList: $('#discard-list'),
 };
 
 const state = {
@@ -120,10 +122,9 @@ function renderShelf() {
   if (!state.books.length) {
     grid.innerHTML = `<div class="shelf-empty">
       <h2>书架还是空的</h2>
-      <p>在数据目录的 <code>books.json</code> 里登记一本书：给它一个 <code>id</code>、
-        一个 <code>repo</code>（本地 clone 路径）、一个 <code>dir</code>（笔记所在目录）。
-        刷新页面就能看到。</p>
-      <p class="muted">也可以先点右上角 ⚙ 连接一个仓库试试。</p>
+      <p>点右上角 ⚙ 添加一本书：粘一个 GitHub 仓库地址（Pile 会克隆到自己的目录，只拉取不推送），
+        或者填一个本地目录（只读浏览，不联网）。</p>
+      <p class="muted">也可以在数据目录的 <code>books.json</code> 里手写条目。</p>
     </div>`;
     return;
   }
@@ -132,9 +133,11 @@ function renderShelf() {
     // 封面用书名里第一个汉字/字母，别拿"2026"的 2 当封面
     const tm = (b.title || '?').trim().match(/[\u4e00-\u9fa5A-Za-z]/);
     const initial = esc(tm ? tm[0] : (b.title || '?').trim().slice(0, 1));
+    const src = b.kind === 'local' ? '本地目录'
+      : b.kind === 'git-external' ? '外部仓库' : '';
     const meta = b.ready
-      ? `${b.count} 篇`
-      : '未克隆到本地';
+      ? `${src ? src + ' · ' : ''}${b.count} 篇`
+      : (b.kind === 'local' ? '目录不存在' : '未克隆到本地');
     return `<article class="book-card${b.ready ? '' : ' not-ready'}" data-id="${esc(b.id)}"
         tabindex="0" role="link" aria-label="${esc(b.title)}"
         style="--cover:${esc(b.cover || '#4c6ef5')}">
@@ -176,6 +179,8 @@ async function openBook(bookId, path, mode = 'replace') {
   el.readerTitle.title = book && book.remote ? book.remote : '';
 
   const st = await refreshState();
+
+  if (st && st.ok) await maybeSoftRefresh();
 
   if (!st || !st.ok) {
     el.tree.innerHTML = '<div class="empty-hint">这本书打不开</div>';
@@ -398,26 +403,50 @@ function highlightQuery(q) {
   if (first) first.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
-/* ------------------------------------------------ 状态与同步 */
+/* ------------------------------------------------ 状态与更新 */
+const REFRESH_TTL = 5 * 60 * 1000;   // 同一本书 5 分钟内只自动拉一次
+
 function renderStatus(st) {
+  const btn = $('#btn-sync');
   if (!st || !st.ok) {
     el.chip.textContent = '未连接';
     el.chip.title = '';
     el.status.textContent = st && st.error ? st.error : '—';
     el.status.className = 'sync-status';
+    if (btn) btn.hidden = true;
     return;
   }
-  el.chip.textContent = st.path.split(/[\\/]/).pop();
-  el.chip.title = st.path;
+  el.chip.textContent = st.path ? st.path.split(/[\\/]/).pop() : '—';
+  el.chip.title = st.path || '';
   el.chip.dataset.ok = '1';
+
+  // 本地目录书：纯静态只读，没有「更新」这回事
+  if (st.kind === 'local') {
+    el.status.textContent = '本地目录 · 只读';
+    el.status.className = 'sync-status local';
+    if (btn) btn.hidden = true;
+    return;
+  }
+
+  // 用户自己的仓库目录：Pile 不碰，不联网
+  if (st.kind === 'git-external') {
+    el.status.textContent = '外部仓库 · 不自动更新';
+    el.status.className = 'sync-status external';
+    if (btn) btn.hidden = true;
+    return;
+  }
+
+  if (btn) btn.hidden = false;
   const bits = [];
   if (st.dirty_count) bits.push(`本地 ${st.dirty_count} 处改动`);
   if (st.behind) bits.push(`远端 ${st.behind} 个新提交`);
-  if (st.ahead) bits.push(`待推送 ${st.ahead} 个`);
-  if (!bits.length) bits.push('已同步');
+  if (!bits.length) bits.push('已是最新');
   el.status.textContent = bits.join(' · ');
   el.status.className = 'sync-status'
     + (st.dirty_count ? ' dirty' : '') + (st.behind ? ' behind' : '');
+  el.status.title = st.push_disabled === false
+    ? '注意：这个仓库还能推送，点「刷新」时会被重新禁用'
+    : 'Pile 只拉取，不推送';
 }
 
 async function refreshState() {
@@ -468,38 +497,67 @@ function anyFile(nodes) {
   return null;
 }
 
-async function doSync() {
-  const btn = $('#btn-sync');
-  btn.disabled = true;
-  btn.textContent = '同步中…';
+/** 打开一本书时，后台拉一次（同一本书 5 分钟内不重复）。 */
+async function maybeSoftRefresh() {
+  const b = state.book;
+  if (!b || b.kind !== 'git-managed' || !b.ready) return;
+  const key = `pile:fresh:${b.id}`;
+  const last = Number(localStorage.getItem(key) || 0);
+  if (Date.now() - last < REFRESH_TTL) return;
+  localStorage.setItem(key, String(Date.now()));
   try {
-    const rep = await post(withBook('/api/sync'));
+    const rep = await post(withBook('/api/refresh'));
+    if (rep.code === 'dirty') { showDiscard(rep.dirty || []); return; }
+    if (rep.ok && rep.pulled) await refreshState();
+  } catch { /* 离线时静默，不打扰阅读 */ }
+}
+
+async function doRefresh(discard = false) {
+  const btn = $('#btn-sync');
+  if (btn) { btn.disabled = true; btn.textContent = discard ? '更新中…' : '检查中…'; }
+  try {
+    const rep = await post(withBook('/api/refresh'), { discard });
+    if (rep.code === 'dirty') { showDiscard(rep.dirty || []); return; }
+    if (rep.code === 'local' || rep.code === 'external') {
+      showReport({ ok: false, error: rep.error, steps: [] });
+      return;
+    }
     showReport(rep);
     await refreshState();
-    if (state.current) openDoc(state.current, { mode: 'replace' });
+    if (rep.ok && rep.pulled && state.current) openDoc(state.current, { mode: 'replace' });
   } catch (e) {
     showReport({ ok: false, error: String(e), steps: [] });
   } finally {
-    btn.disabled = false;
-    btn.textContent = '同步';
+    if (btn) { btn.disabled = false; btn.textContent = '刷新'; }
   }
 }
 
+function showDiscard(files) {
+  el.discardList.innerHTML = files.length
+    ? `<div class="discard-files">${files.map((f) => `<code>${esc(f)}</code>`).join(' ')}</div>`
+    : '';
+  el.discardOverlay.hidden = false;
+}
+
 function showReport(rep) {
-  $('#report-title').textContent = rep.ok ? '同步完成' : '同步未完成';
+  $('#report-title').textContent = rep.ok
+    ? ((rep.pulled || 0) > 0 ? '更新完成' : '已经是最新的')
+    : '更新未完成';
   const rows = (rep.steps || []).map((s) => `
     <div class="report-step">
       <span class="mark ${s.ok ? 'ok' : 'bad'}">${s.ok ? '✓' : '✗'}</span>
       <span>${esc(s.name)}${s.detail ? `<div class="detail">${esc(s.detail)}</div>` : ''}</span>
     </div>`).join('');
   const summary = rep.ok
-    ? `<p class="muted">拉取 ${rep.pulled || 0} 个提交，推送 ${rep.pushed || 0} 个提交。</p>`
+    ? `<p class="muted">${(rep.pulled || 0) > 0
+        ? `从远端拉取 ${rep.pulled} 个提交。`
+        : '远端没有新提交。'}Pile 不会上传任何内容。</p>`
     : `<p class="muted">${esc(rep.error || '')}</p>`;
-  const conflicts = (rep.conflicts || []).length
-    ? `<div class="report-conflict">冲突文件（本地与远端改了同一处，需手工解决后再同步）：<br>${
-        rep.conflicts.map((c) => `<code>${esc(c)}</code>`).join(' ')}</div>`
+  const discarded = (rep.discarded || []).length
+    ? `<div class="report-conflict">已丢弃的本地改动${rep.trash ? `（备份：<code>${esc(rep.trash)}</code>）` : ''}：<br>${
+        rep.discarded.map((c) => `<code>${esc(c)}</code>`).join(' ')}</div>`
     : '';
-  $('#report-body').innerHTML = summary + rows + conflicts;
+  $('#report-body').innerHTML = summary + rows + discarded;
   el.reportOverlay.hidden = false;
 }
 
@@ -553,31 +611,44 @@ function openSetup() {
   $('#input-path').value = state.repoPath || '';
   $('#setup-msg').textContent = '';
   $('#input-path').focus();
+  $('#setup-msg').textContent = '';
 }
 
 async function submitSetup() {
-  const repo = $('#input-path').value.trim().replace(/^["']|["']$/g, '');
-  const dest = $('#input-dest').value.trim();
-  const token = $('#input-token').value.trim();
+  const clean = (v) => String(v || '').trim().replace(/^["']|["']$/g, '');
+  const url = clean($('#input-path').value);
+  const local = clean($('#input-local').value);
+  const token = clean($('#input-token').value);
   const msg = (t) => { $('#setup-msg').textContent = t; };
-  if (!repo) { msg('请填写仓库地址或本地路径'); return; }
-  const isUrl = /^(https?:\/\/|git@|ssh:\/\/|git:\/\/)/i.test(repo);
-  msg(isUrl ? '正在克隆，仓库大时要等一会儿…' : '连接中…');
-  const st = isUrl
-    ? await post('/api/clone', { url: repo, dest, token })
-    : await post('/api/setup', { path: repo, token });
-  if (!st.ok) { msg(st.error || '连接失败'); return; }
+  if (url && local) { msg('两栏只填一个：仓库地址，或者本地目录'); return; }
+  if (!url && !local) { msg('请填写仓库地址或本地目录'); return; }
+
+  const isUrl = /^(https?:\/\/|git@|ssh:\/\/|git:\/\/)/i.test(url || local);
+  if (url && !isUrl) { msg('仓库地址要以 https:// 或 git@ 开头'); return; }
+
+  if (url) {
+    msg('正在克隆到 Pile 自己的目录，仓库大时要等一会儿…');
+    const r = await post('/api/clone', { url, token });
+    if (!r.ok) { msg(r.error || '克隆失败'); return; }
+  } else {
+    msg('正在添加本地目录…');
+    const r = await post('/api/add-local', { path: local });
+    if (!r.ok) { msg(r.error || '添加失败'); return; }
+  }
+
   msg('');
   el.setupOverlay.hidden = true;
   $('#input-token').value = '';
-  state.current = null;
-  await go('/');
+  $('#input-path').value = '';
+  $('#input-local').value = '';
+  state.books = [];
+  await route();
 }
 
 /* ------------------------------------------------ 事件绑定 */
 function bindEvents() {
   $('#btn-back').onclick = () => go('/');
-  $('#btn-sync').onclick = doSync;
+  $('#btn-sync').onclick = () => doRefresh(false);
   $('#btn-search').onclick = openSearch;
   $('#btn-theme').onclick = toggleTheme;
   $('#btn-theme-shelf').onclick = toggleTheme;
@@ -592,6 +663,11 @@ function bindEvents() {
   $('#btn-cancel-setup').onclick = () => { el.setupOverlay.hidden = true; };
   $('#btn-do-setup').onclick = submitSetup;
   $('#btn-close-report').onclick = () => { el.reportOverlay.hidden = true; };
+  $('#btn-discard-cancel').onclick = () => { el.discardOverlay.hidden = true; };
+  $('#btn-discard-confirm').onclick = () => {
+    el.discardOverlay.hidden = true;
+    doRefresh(true);
+  };
 
   el.searchInput.oninput = (e) => {
     clearTimeout(searchTimer);
@@ -601,7 +677,8 @@ function bindEvents() {
 
   document.addEventListener('keydown', (e) => {
     const typing = /^(INPUT|TEXTAREA)$/.test(e.target.tagName);
-    const overlayOpen = !el.searchOverlay.hidden || !el.setupOverlay.hidden || !el.reportOverlay.hidden;
+    const overlayOpen = !el.searchOverlay.hidden || !el.setupOverlay.hidden
+      || !el.reportOverlay.hidden || !el.discardOverlay.hidden;
     if (e.key === '/' && !typing && !overlayOpen) {
       e.preventDefault(); openSearch();
     } else if (e.key === 'Escape') {
@@ -609,6 +686,7 @@ function bindEvents() {
         el.searchOverlay.hidden = true;
         el.setupOverlay.hidden = true;
         el.reportOverlay.hidden = true;
+        el.discardOverlay.hidden = true;
         document.body.classList.remove('mobile-open');
       } else if (state.bookId) {
         go('/');
@@ -618,12 +696,12 @@ function bindEvents() {
     } else if (e.key === 'k' && !typing && state.bookId) {
       el.content.scrollBy({ top: -180 });
     } else if (e.key === 's' && (e.ctrlKey || e.metaKey) && state.bookId) {
-      e.preventDefault(); doSync();
+      e.preventDefault(); doRefresh(false);
     }
   });
 
   // 点击遮罩关闭
-  [el.searchOverlay, el.setupOverlay, el.reportOverlay].forEach((o) => {
+  [el.searchOverlay, el.setupOverlay, el.reportOverlay, el.discardOverlay].forEach((o) => {
     o.addEventListener('click', (e) => { if (e.target === o) o.hidden = true; });
   });
 

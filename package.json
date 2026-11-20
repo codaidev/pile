@@ -1,6 +1,6 @@
 {
   "name": "pile",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Pile：把散落在各个仓库和本地目录里的 Markdown 笔记聚到一个书架",
   "author": "codaidev",
@@ -9,7 +9,8 @@
   "scripts": {
     "start": "electron .",
     "fetch-git": "node scripts/fetch-git.mjs",
-    "dist": "electron-builder --win nsis"
+    "dist": "electron-builder --win zip --x64",
+    "dist:installer": "electron-builder --win nsis --x64"
   },
   "devDependencies": {
     "electron": "45.4.1",
@@ -39,6 +40,12 @@
       "!**/*.map",
       "!**/dev-data/**"
     ],
+    "extraFiles": [
+      {
+        "from": "build/使用说明.txt",
+        "to": "使用说明.txt"
+      }
+    ],
     "extraResources": [
       {
         "from": "git",
@@ -52,13 +59,13 @@
       "icon": "build/icon.ico",
       "target": [
         {
-          "target": "nsis",
+          "target": "zip",
           "arch": [
             "x64"
           ]
         }
       ],
-      "artifactName": "pile-${version}-setup.${ext}"
+      "artifactName": "Pile-${version}-win-x64.${ext}"
     },
     "nsis": {
       "oneClick": false,
@@ -73,7 +80,7 @@
       "language": "2052",
       "deleteAppDataOnUninstall": false,
       "runAfterFinish": true,
-      "artifactName": "pile-${version}-setup.${ext}",
+      "artifactName": "Pile-${version}-setup.${ext}",
       "include": "installer.nsh"
     },
     "afterPack": "build/afterPack.js"
