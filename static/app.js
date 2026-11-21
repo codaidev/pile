@@ -286,6 +286,32 @@ function renderMarkdown(md) {
   return DOMPurify.sanitize(html, { ADD_ATTR: ['target', 'id'] });
 }
 
+/* 笔记里的相对图片：/read/<书>/<文档> 这种地址下相对路径拿不到文件，
+   统一改写成 /api/asset?book=..&path=..，由服务端按书根解析。 */
+function joinRel(fromDoc, src) {
+  const dir = fromDoc.includes('/') ? fromDoc.slice(0, fromDoc.lastIndexOf('/')) : '';
+  const raw = decodeURI(src);
+  const parts = (dir ? dir.split('/') : []).concat(raw.split('/'));
+  const out = [];
+  for (const p of parts) {
+    if (!p || p === '.') continue;
+    if (p === '..') out.pop();
+    else out.push(p);
+  }
+  return out.join('/');
+}
+
+function rewriteImages(docPath) {
+  el.article.querySelectorAll('img[src]').forEach((img) => {
+    const src = img.getAttribute('src') || '';
+    if (!src || /^(https?:|data:|blob:|\/)/i.test(src)) return;
+    const rel = joinRel(docPath, src);
+    if (!rel) return;
+    img.setAttribute('src', withBook(`/api/asset?path=${encodeURIComponent(rel)}`));
+    img.setAttribute('loading', 'lazy');
+  });
+}
+
 function decorateArticle() {
   // 标题加锚点
   const heads = [...el.article.querySelectorAll('h1, h2, h3, h4')];
@@ -364,6 +390,7 @@ async function openDoc(path, opts = {}) {
     h.textContent = fmTitle;
     el.article.insertBefore(h, el.article.firstChild);
   }
+  rewriteImages(path);
   decorateArticle();
   const saved = Number(localStorage.getItem(`np:pos:${state.bookId}:${path}`) || 0);
   el.content.scrollTop = opts.jumpSearch ? 0 : saved;

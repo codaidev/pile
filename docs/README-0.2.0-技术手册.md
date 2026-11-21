@@ -210,6 +210,7 @@ zip 约 149 MB，解压后约 418 MB（Electron 运行时 + 精简后的 Portabl
 | `GET /api/tree?book=` | 目录树（只列 `.md`） |
 | `GET /api/doc?book=&path=` | 单篇 Markdown + front-matter |
 | `GET /api/search?book=&q=` | 全库全文搜索（子串匹配，带上下文） |
+| `GET /api/asset?book=&path=` | 笔记里引用的相对图片（png/jpg/webp/gif/svg/avif），按书根解析，防穿越 |
 | `POST /api/setup` | 绑定本地仓库路径 |
 | `POST /api/clone` | 从远端 clone 到本地 |
 | `POST /api/token` | 保存 / 清除 PAT |

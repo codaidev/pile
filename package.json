@@ -1,6 +1,6 @@
 {
   "name": "pile",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Pile：把散落在各个仓库和本地目录里的 Markdown 笔记聚到一个书架",
   "author": "codaidev",

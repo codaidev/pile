@@ -31,6 +31,8 @@ const MIME = {
   '.md': 'text/markdown; charset=utf-8',
 };
 
+const ASSET_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.avif']);
+
 const CSP = [
   "default-src 'self'",
   "img-src 'self' data: blob:",
@@ -147,6 +149,33 @@ function createServer({ staticDir }) {
       const { root } = store.bookRootOf(bid);
       if (!root) return send(res, 200, { ok: false, error: '未配置仓库' });
       return send(res, 200, await docs.readDoc(root, qs.get('path') || ''));
+    }
+
+    // 笔记里的相对图片：按书根解析后原样回传二进制
+    if (u.pathname === '/api/asset') {
+      const { root } = store.bookRootOf(bid);
+      if (!root) return send(res, 404, { ok: false, error: '未配置仓库' });
+      const rel = qs.get('path') || '';
+      const ext = path.extname(rel).toLowerCase();
+      if (!ASSET_EXT.has(ext)) return send(res, 404, { ok: false, error: '不支持的文件类型' });
+      const full = path.resolve(root, rel);
+      const base = path.resolve(root);
+      if (full !== base && !full.startsWith(base + path.sep)) {
+        return send(res, 404, { ok: false, error: '文件不存在' });
+      }
+      let buf;
+      try {
+        buf = await fsp.readFile(full);
+      } catch (e) {
+        return send(res, 404, { ok: false, error: '文件不存在' });
+      }
+      res.writeHead(200, {
+        'Content-Type': MIME[ext] || 'application/octet-stream',
+        'Content-Length': buf.length,
+        'Cache-Control': 'no-cache',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return res.end(buf);
     }
 
     if (u.pathname === '/api/search') {
